@@ -5,7 +5,8 @@ mod epoll {
     pub const EPOLL_CTL_ADD: i32 = 1;
     pub const EPOLL_CTL_DEL: i32 = 2;
     pub const EPOLLIN: i32 = 0x1;
-    pub const EPOLLONESHOT: i32 = 0x40000000;
+    pub const EPOLLONESHOT: i32 = 1 << 30;
+    pub const EPOLLET:i32 = 1 << 31;
 
     // Module providing unsafe ffi for Linux's epoll and epoll-adjacent syscalls.
     mod ffi {
@@ -112,8 +113,10 @@ mod blockers {
             const MAX_EVENTS: i32 = 1024;
             events.clear();
 
-            let n_events = epoll::wait(self.fd, events, MAX_EVENTS, TIMEOUT)?;
+            println!("IoBlocker::block --> begin wait on {}", self.fd);
 
+            let n_events = epoll::wait(self.fd, events, MAX_EVENTS, TIMEOUT)?;
+            println!("IoBlocker::block --> done waiting for {} events", n_events);
             // Rust has no way of knowing events vec changed size, since
             // this happened in unsafe FFI world. Forcefully change size here.
             // Note this should never introduce problems, unless the OS
@@ -141,8 +144,10 @@ mod blockers {
         // Register a file descriptor of interest.
         pub fn register(&self, interest: &impl AsRawFd, token: usize) -> io::Result<()> {
             let fd = interest.as_raw_fd();
-            let mut event = epoll::Event::new(epoll::EPOLLIN | epoll::EPOLLONESHOT, token);
+            let mut event = epoll::Event::new(epoll::EPOLLIN | epoll::EPOLLET, token);
+            println!("Registrator::register --> registering {} to {}", fd, self.fd);
             epoll::ctl(self.fd, epoll::EPOLL_CTL_ADD, fd, &mut event)?;
+            println!("Registrator::register --> success {} to {}", fd, self.fd);
 
             Ok(())
         }
@@ -166,12 +171,14 @@ mod services {
         // We use the non-async TcpStream as a starting point for our implementation.
         inner: net::TcpStream,
         registrator: blockers::Registrator,
+        token: usize,
     }
 
     impl TcpStream {
         pub fn connect(
             addr: impl net::ToSocketAddrs,
             registrator: blockers::Registrator,
+            token: usize,
         ) -> io::Result<Self> {
             let stream = net::TcpStream::connect(addr)?;
             stream.set_nonblocking(true)?;
@@ -179,6 +186,7 @@ mod services {
             Ok(TcpStream {
                 inner: stream,
                 registrator,
+                token
             })
         }
     }
@@ -195,7 +203,8 @@ mod services {
                 // Since we set this TcpStream to non-blocking, check if
                 // still not ready and pend.
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    stream.registrator.register(stream, 1).unwrap();
+                    println!("TcpStream::poll_read --> calling register");
+                    stream.registrator.register(stream, stream.token).unwrap();
                     Poll::Pending
                 }
                 // Another error occurred, done.
@@ -256,6 +265,7 @@ mod runtime {
 
     // Reactor struct, responsible for receiving tasks and sending them to the
     // Executor.
+    #[derive(Clone)]
     pub struct Reactor {
         sender: mpsc::SyncSender<Arc<Task>>,
         registrator: blockers::Registrator,
@@ -274,13 +284,17 @@ mod runtime {
         }
         // Run all tasks to completion.
         pub fn run(&self) {
+            println!("Executor::run --> begin");
             while let Ok(task) = self.receiver.recv() {
+                println!("Executor::run --> received something");
                 let fut = &mut *task.future.lock().unwrap();
 
                 let waker = Waker::from(Arc::clone(&task));
                 let cx = &mut Context::from_waker(&waker);
 
-                if fut.as_mut().poll(cx).is_pending() {}
+                if fut.as_mut().poll(cx).is_pending() {
+                    println!("Executor::run --> poll pending");
+                };
             }
         }
     }
@@ -293,7 +307,7 @@ mod runtime {
             let cloned_sender = sender.clone();
             let cloned_map = Arc::clone(&event_map);
             let registrator = blocker.registrator();
-            // Spawn a new thread that blocks until an event is ready.
+            // Spawn a new thread detached that blocks until an event is ready.
             let handle = thread::spawn(move || {
                 let mut events: Vec<epoll::Event> = Vec::with_capacity(1024);
                 loop {
@@ -304,6 +318,7 @@ mod runtime {
                         Err(e) => panic!("Poll error: {:?}, {}", e.kind(), e),
                     };
                     for event in &events {
+                        println!("Reactor::new --> got event");
                         let event_token = event.token();
                         match cloned_map.read().unwrap().get(&event_token) {
                             Some(task) => cloned_sender
@@ -326,6 +341,7 @@ mod runtime {
                 future: Mutex::new(Box::pin(future)),
                 ready_queue: self.sender.clone(),
             });
+            println!("Reactor::subscribe --> subscribing {}", token);
             self.sender
                 .send(task)
                 .expect("Failed to send task to executor.");
@@ -354,7 +370,7 @@ mod tests {
     use super::*;
 
     use futures::io::AsyncReadExt;
-    use std::io::Write;
+    use std::io::{Write, self};
     use std::sync::mpsc;
 
     #[test]
@@ -371,8 +387,8 @@ mod tests {
         // This site simulates slow server responses.
         let addr = "flash.siwalik.in:80";
 
-        for i in 1..6 {
-            let mut stream = services::TcpStream::connect(addr, registrator).unwrap();
+        for i in 1..4 {
+            let mut stream = services::TcpStream::connect(addr, registrator, i).unwrap();
 
             let delay = i * 1000;
             // The desired delay is passed in the GET request in miliseconds.
@@ -385,16 +401,15 @@ mod tests {
             );
 
             stream.write_all(request.as_bytes()).unwrap();
-            // streams.push(stream);
-
+            
             let future = async move {
                 let mut buf = String::new();
                 stream.read_to_string(&mut buf).await.unwrap();
-                println!("contents: {}", buf);
+                println!("yay {}", i);
+                // println!("contents: {}", buf);
             };
             reactor.subscribe(future, i);
         }
-
         executor.run();
     }
 }
