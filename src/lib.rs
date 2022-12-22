@@ -18,7 +18,12 @@ mod epoll {
             // https://man7.org/linux/man-pages/man2/epoll_ctl.2.html
             pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut super::Event) -> i32;
             // https://man7.org/linux/man-pages/man2/epoll_wait.2.html
-            pub fn epoll_wait(epfd: i32, events: *mut super::Event, maxevents: i32, timeout: i32) -> i32;
+            pub fn epoll_wait(
+                epfd: i32,
+                events: *mut super::Event,
+                maxevents: i32,
+                timeout: i32,
+            ) -> i32;
         }
     }
 
@@ -50,7 +55,7 @@ mod epoll {
         }
     }
 
-    fn wait(epfd: i32, events: &mut [Event], maxevents: i32, timeout: i32) -> io::Result<i32> {
+    pub fn wait(epfd: i32, events: &mut [Event], maxevents: i32, timeout: i32) -> io::Result<i32> {
         let res = unsafe { ffi::epoll_wait(epfd, events.as_mut_ptr(), maxevents, timeout) };
         if res < 0 {
             Err(io::Error::last_os_error())
@@ -67,11 +72,8 @@ mod epoll {
     }
 
     impl Event {
-        pub fn new(events: u32, id: usize) -> Self {
-            Event {
-                events: events,
-                epoll_data: id,
-            }
+        pub fn new(events: i32, epoll_data: usize) -> Self {
+            Event { events: events as u32, epoll_data }
         }
         pub fn data(&self) -> usize {
             self.epoll_data
@@ -79,16 +81,142 @@ mod epoll {
     }
 }
 
-mod queue {}
+// Interfaces with epoll to provide OS-level I/O polling.
+mod blockers {
+    use std::io;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use crate::epoll;
 
-// Module implementing our Task, Reactor and Executor structs.
+    pub struct IoBlocker {
+        fd: RawFd,
+    }
+
+    impl IoBlocker {
+        pub fn new() -> io::Result<Self> {
+            match epoll::create() {
+                Ok(fd) => Ok(IoBlocker { fd }),
+                Err(e) => Err(e),
+            }
+        }
+
+        // Register a file descriptor of interest.
+        pub fn register(&self, interest: &impl AsRawFd, token: usize) -> io::Result<()>{
+            let fd = interest.as_raw_fd();
+            let mut event = epoll::Event::new(epoll::EPOLLIN | epoll::EPOLLONESHOT, token);
+            epoll::ctl(self.fd, epoll::EPOLL_CTL_ADD, fd, &mut event)?;
+
+            Ok(())
+        }
+
+        // Block until an event is available.
+        pub fn block(&self, events: &mut Vec<epoll::Event>) -> io::Result<i32>{
+            const TIMEOUT: i32 = -1;    // Wait forever.
+            const MAX_EVENTS: i32 = 1024;
+            events.clear();
+
+            let n_events = epoll::wait(self.fd, events, MAX_EVENTS, TIMEOUT)?;
+
+            // Rust has no way of knowing events vec changed size, since
+            // this happened in unsafe FFI world. Forcefully change size here.
+            // Note this should never introduce problems, unless the OS
+            // did something wrong.
+            unsafe { events.set_len(n_events as usize) };
+
+            Ok(n_events)
+        }
+    }
+
+    // Ensure that we close held file descriptor.
+    impl Drop for IoBlocker {
+        fn drop(&mut self) {
+            epoll::close(self.fd).unwrap();
+        }
+    }
+}
+
+// Provides future API for awaitable services. For use by external crates.
+// In this case, the only provided service is a TcpStream.
+mod services {
+    use std::{net, future::Future, pin::Pin, task::{Context, Poll}};
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use futures::io::{AsyncRead, AsyncReadExt };
+    use std::io::{self, Read, Write, Error};
+    use crate::blockers;
+
+    pub struct TcpStream<'a> {
+        // We use the non-async TcpStream as a starting point for our implementation.
+        inner: net::TcpStream,
+        blocker: &'a blockers::IoBlocker,
+    }
+
+    impl<'a> TcpStream<'a> {
+        pub fn connect(addr: impl net::ToSocketAddrs, blocker: &'a blockers::IoBlocker) -> io::Result<Self> {
+            let stream = net::TcpStream::connect(addr)?;
+            stream.set_nonblocking(true)?;
+
+            Ok (TcpStream { inner: stream, blocker })
+        }
+    }
+
+    impl AsyncRead for TcpStream<'_> { 
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8]
+        ) -> Poll<Result<usize, Error>> {
+            let stream = self.get_mut();
+            match stream.inner.read(buf) {
+                Ok(n) => Poll::Ready(Ok(n)),
+                // Since we set this TcpStream to non-blocking, check if
+                // still not ready and pend.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let blocker = stream.blocker;
+                    match blocker.register(stream, 10) {
+                        Ok(_) => Poll::Pending,
+                        Err(e) => Poll::Ready(Err(e)),
+                    }
+                },
+                // Another error occurred, done.
+                Err(e) => Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    impl Write for TcpStream<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    // Allows us to retrieve the file descriptor associated with this stream.
+    impl AsRawFd for TcpStream<'_> {
+        fn as_raw_fd(&self) -> RawFd {
+            self.inner.as_raw_fd()
+        }
+    }
+
+    // impl Future for TcpStream {
+    //     type Output = ();
+    //     fn poll(self: Pin<&mut Self>, wake: &mut Context<'_>) -> Poll<Self::Output> {
+    //     }
+    // }
+
+}
+
+// Implements reactor/executor design pattern. For use by external crates.
 mod runtime {
     use std::{
         future::Future,
         pin::Pin,
         sync::{mpsc, Arc, Mutex},
         task::{Context, Wake, Waker},
+        thread
     };
+    use crate::epoll;
 
     use futures::task::ArcWake;
     // Task struct, holding a Future instance and a ready_queue enqueuer.
@@ -129,7 +257,9 @@ mod runtime {
                 let waker = Waker::from(Arc::clone(&task));
                 let cx = &mut Context::from_waker(&waker);
 
-                if fut.as_mut().poll(cx).is_pending() {}
+                if fut.as_mut().poll(cx).is_pending() {
+
+                }
             }
         }
     }
@@ -137,6 +267,22 @@ mod runtime {
     impl Reactor {
         // Create a new Reactor instance.
         pub fn new(sender: mpsc::SyncSender<Arc<Task>>) -> Reactor {
+            // Spawn a new thread that blocks until an event is ready.
+            let handle = thread::spawn(move || {
+                let mut events: Vec<epoll::Event> = Vec::with_capacity(1024);
+                loop {
+                    // Blocks until an event is ready.
+                    match poll.poll(&mut events, Some(200)) {
+                        Ok(_) => (),
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => break,
+                        Err(e) => panic!("Poll error: {:?}, {}", e.kind(), e),
+                    };
+                    for event in &events {
+                        let event_token = event.id();
+                        evt_sender.send(event_token).expect("send event_token err.");
+                    }
+                }
+            });
             Reactor { sender }
         }
         // Add a future to the task list.
@@ -177,26 +323,85 @@ mod runtime {
                 .expect("Failed to send task to `ready_queue`");
         }
     }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::os::unix::prelude::AsRawFd;
     use std::sync::mpsc;
+    use std::io::{self, Write};
+    use futures::io::{ AsyncReadExt };
 
     #[test]
     fn it_works() {
         const MAX_CHANNELS: usize = 1000;
 
         let (sender, receiver) = mpsc::sync_channel(MAX_CHANNELS);
+        let blocker = blockers::IoBlocker::new().unwrap();
 
         let reactor = runtime::Reactor::new(sender);
         let executor = runtime::Executor::new(receiver);
 
-        reactor.subscribe(async {
-            println!("hello");
-        });
+        // This site simulates slow server responses.
+        let addr = "flash.siwalik.in:80";
+        // let mut streams = Vec::new();
+        const TOKEN: usize = 10;
+        for i in 1..6 {
+            let mut stream = services::TcpStream::connect(addr).unwrap();
+
+            let delay = (5 - i) * 1000;
+            // The desired delay is passed in the GET request in miliseconds.
+            let request = format!(
+                "GET /delay/{}/url/http://www.google.com HTTP/1.1\r\n\
+                Host: flash.siwalik.in\r\n\
+                Connection: close\r\n\
+                \r\n",
+                delay
+            );
+
+            stream.write_all(request.as_bytes()).unwrap();
+            blocker.register(&stream, i).unwrap();
+            // streams.push(stream);
+
+            let future = async {
+                let mut buf = String::new();
+                stream.read_to_string(&mut buf).await;
+                println!("contents: {}", buf);
+            };
+            reactor.subscribe(future);
+        }
+
         executor.run();
+        // let mut events = Vec::with_capacity(10);
+        // let n_events = blocker.block(&mut events).unwrap();
+        // println!("event count {}", n_events);
+        // println!("aa {:?}", events.iter().enumerate());
+        // for event in events {
+        //     println!("woah");
+        //     println!("RECEIVED: {:?}", event);
+        //     // if i >= n_events as usize {
+        //     //     break;
+        //     // }
+        // }
+        // let mut events = Vec::with_capacity(10);
+        // let n_events = blocker.block(&mut events).unwrap();
+        // unsafe { events.set_len(n_events as usize) };
+        // println!("event count {}", n_events);
+        // println!("aa {:?}", events.iter().enumerate());
+        // for event in events {
+        //     println!("woah");
+        //     println!("RECEIVED: {:?}", event);
+        //     // if i >= n_events as usize {
+        //     //     break;
+        //     // }
+        // }
+
+        // reactor.subscribe(async {
+        //     println!("hello");
+        // });
+        // executor.run();
     }
 }
