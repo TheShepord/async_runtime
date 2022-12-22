@@ -1,0 +1,4 @@
+[ZoneTransfer]
+ZoneId=3
+ReferrerUrl=https://www.notion.so/
+HostUrl=https://s3.us-west-2.amazonaws.com/temporary.notion-static.com/Export-f7e9a5a2-1927-4a9c-b2f9-b161f455f372/CPSC_524_Final_Project.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=AKIAT73L2G45EIPT3X45%2F20221222%2Fus-west-2%2Fs3%2Faws4_request&X-Amz-Date=20221222T045824Z&X-Amz-Expires=604800&X-Amz-Signature=c34fe46b8cd0dd06e1d86a276407753a17eb31dba5278e277fc7474f7ada0f92&X-Amz-SignedHeaders=host&x-id=GetObject
