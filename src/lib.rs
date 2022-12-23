@@ -87,7 +87,7 @@ mod epoll {
 }
 
 // Interfaces with epoll to provide OS-level I/O polling.
-mod blockers {
+pub mod blockers {
     use crate::epoll;
     use std::io;
     use std::os::unix::io::{AsRawFd, RawFd};
@@ -115,15 +115,14 @@ mod blockers {
             events.clear();
             // std::thread::sleep(core::time::Duration::from_secs(1));
 
-            // println!("IoBlocker::block --> begin wait on {}", self.fd);
+            // println!("IoBlocker::block --> begin blocking");
             let n_events = epoll::wait(self.fd, events, MAX_EVENTS, TIMEOUT)?;
-            // println!("IoBlocker::block --> done waiting for {} events", n_events);
             // Rust has no way of knowing events vec changed size, since
             // this happened in unsafe FFI world. Forcefully change size here.
             // Note this should never introduce problems, unless the OS
             // did something wrong.
             unsafe { events.set_len(n_events as usize) };
-
+            // println!("IoBlocker::block --> done waiting for events {:?}", events);
             Ok(n_events)
         }
     }
@@ -146,11 +145,15 @@ mod blockers {
         // Register a file descriptor of interest.
         pub fn register(&self, interest: &impl AsRawFd, token: usize) -> io::Result<()> {
             let fd = interest.as_raw_fd();
-            let mut event = epoll::Event::new(epoll::EPOLLIN | epoll::EPOLLET, token);
-            // println!("Registrator::register --> registering {} to {}", fd, self.fd);
+
+            // Listen for file to become readable.
+            let mut event = epoll::Event::new(epoll::EPOLLIN | epoll::EPOLLONESHOT, token);
             match epoll::ctl(self.fd, epoll::EPOLL_CTL_ADD, fd, &mut event) {
                 Ok(_) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // one-shot epoll consumed, so needs to be re-armed.
+                    epoll::ctl(self.fd, epoll::EPOLL_CTL_MOD, fd, &mut event)
+                },
                 Err(e) => Err(e),
             }
         }
@@ -168,7 +171,7 @@ mod blockers {
 
 // Provides future API for awaitable services. For use by external crates.
 // In this case, the only provided service is a TcpStream.
-mod services {
+pub mod services {
     use crate::blockers;
     use futures::io::{AsyncRead, AsyncWrite};
     use std::io::{self, Error, Read, Write};
@@ -279,28 +282,16 @@ mod services {
             self.inner.as_raw_fd()
         }
     }
-
-    impl Drop for TcpStream {
-        fn drop(&mut self) {
-            // println!("dropping stream {}", self.token);
-        }
-    }
-
-    // impl Future for TcpStream {
-    //     type Output = ();
-    //     fn poll(self: Pin<&mut Self>, wake: &mut Context<'_>) -> Poll<Self::Output> {
-    //     }
-    // }
 }
 
 // Implements reactor/executor design pattern. For use by external crates.
-mod runtime {
+pub mod runtime {
     use crate::{blockers, epoll};
     use std::{
         collections::HashMap,
         future::Future,
         pin::Pin,
-        sync::{mpsc, Arc, Mutex, RwLock},
+        sync::{mpsc, Arc, Mutex},
         task::{Context, Wake, Waker},
         thread,
     };
@@ -313,163 +304,127 @@ mod runtime {
         // implements the `Send` trait.
         future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
         // Multiple-Producer Single-Consumer channel.
-        // Tasks are sent through this ready queue to be scheduled.
-        // We use a `SyncSender` as opposed to a regular `Sender` to allow for sending
-        // `MyTask` between threads.
-        ready_queue: mpsc::SyncSender<Arc<Task>>,
+        // Task IDs are sent through this ready queue to be scheduled.
+        // We use a `SyncSender` as opposed to a regular `Sender` to allow for sharing
+        // the sender between threads.
+        ready_queue: mpsc::SyncSender<usize>,
+        token: usize,
     }
 
     // Reactor struct, responsible for receiving tasks and sending them to the
     // Executor.
-    #[derive(Clone)]
     pub struct Reactor {
-        sender: mpsc::SyncSender<Arc<Task>>,
         registrator: blockers::Registrator,
-        event_map: Arc<RwLock<HashMap<usize, Arc<Task>>>>,
+        // Hold onto join handle for
+        handle: std::thread::JoinHandle<()>,
     }
 
     // Executor struct, responsible for running pending tasks.
     pub struct Executor {
-        receiver: mpsc::Receiver<Arc<Task>>,
+        receiver: mpsc::Receiver<usize>,
+        // Map from task token to a suspended task.
+        task_map: HashMap<usize, Arc<Task>>,
     }
 
-    impl Executor {
-        // Create a new Executor instance.
-        pub fn new(receiver: mpsc::Receiver<Arc<Task>>) -> Executor {
-            Executor { receiver }
-        }
-        // Run all tasks to completion.
-        pub fn run(&self) {
-            // println!("Executor::run --> begin");
-            while let Ok(task) = self.receiver.recv() {
-                // println!("Executor::run --> received something");
-                let fut = &mut *task.future.lock().unwrap();
-
-                let waker = Waker::from(Arc::clone(&task));
-                let cx = &mut Context::from_waker(&waker);
-
-                if fut.as_mut().poll(cx).is_pending() {
-                    // println!("Executor::run --> poll pending");
-                };
-            }
-            // println!("Executor::run --> Finished running");
+    impl Task {
+        pub fn new(
+            future: impl Future<Output = ()> + Send + 'static,
+            ready_queue: mpsc::SyncSender<usize>,
+            token: usize,
+        ) -> Arc<Task> {
+            Arc::new(Task {
+                future: Mutex::new(Box::pin(future)),
+                ready_queue,
+                token,
+            })
         }
     }
 
+    impl Wake for Task {
+        fn wake(self: Arc<Self>) {
+            self.ready_queue
+                .send(self.token)
+                .expect("Failed to send task to `ready_queue`");
+        }
+    }
+
+    
     impl Reactor {
         // Create a new Reactor instance.
-        pub fn new(sender: mpsc::SyncSender<Arc<Task>>, blocker: blockers::IoBlocker) -> Reactor {
-            let event_map: Arc<RwLock<HashMap<usize, Arc<Task>>>> =
-                Arc::new(RwLock::new(HashMap::new()));
-            let cloned_sender = sender.clone();
-            let cloned_map = Arc::clone(&event_map);
+        pub fn new(sender: mpsc::SyncSender<usize>) -> Reactor {
+            let blocker = blockers::IoBlocker::new().unwrap();
             let registrator = blocker.registrator();
-            // Spawn a new detached thread that blocks until an event is ready.
+
+            // Spawn a new thread that blocks until an event is ready.
             let handle = thread::spawn(move || {
                 let mut events: Vec<epoll::Event> = Vec::with_capacity(1024);
                 loop {
                     // Blocks until an event is ready.
                     match &blocker.block(&mut events) {
                         Ok(_) => (),
-                        // Err(ref e) if e.kind() == io::ErrorKind::Interrupted => break,
                         Err(e) => panic!("Poll error: {:?}, {}", e.kind(), e),
                     };
                     for event in &events {
-                        // println!("Reactor::new --> got event");
                         let event_token = event.token();
-                        match cloned_map.read().unwrap().get(&event_token) {
-                            Some(task) => cloned_sender
-                                .send(Arc::clone(task))
-                                .expect("send event_token err."),
-                            None => (),
-                        }
+                        // println!("Reactor::new --> got event {}", event_token);
+                        sender.send(event_token).unwrap();
                     }
                 }
             });
             Reactor {
-                sender,
                 registrator,
-                event_map,
+                handle,
             }
         }
-        // Add a future to the task list.
-        pub fn subscribe(&self, future: impl Future<Output = ()> + Send + 'static, token: usize) {
-            let task = Arc::new(Task {
-                future: Mutex::new(Box::pin(future)),
-                ready_queue: self.sender.clone(),
-            });
-            self.event_map
-                .write()
-                .unwrap()
-                .insert(token, Arc::clone(&task));
-            // println!("Reactor::subscribe --> subscribing {}", token);
-            self.sender
-                .send(task)
-                .expect("Failed to send task to executor.");
+
+        pub fn registrator(&self) -> blockers::Registrator {
+            self.registrator.clone()
         }
     }
 
-    impl Wake for Task {
-        fn wake(self: Arc<Self>) {
-            let clone = Arc::clone(&self);
-            self.ready_queue
-                .send(clone)
-                .expect("Failed to send task to `ready_queue`");
+    impl Executor {
+        // Create a new Executor instance.
+        pub fn new(receiver: mpsc::Receiver<usize>) -> Executor {
+            let task_map: HashMap<usize, Arc<Task>> = HashMap::new();
+            Executor { receiver, task_map }
         }
+        // Run all tasks to completion.
+        pub fn run(&mut self) {
+            // println!("Executor::run --> begin");
+            for (_, task) in self.task_map.iter() {
+                let waker = Waker::from(Arc::clone(task));
+                waker.wake();
+            }
 
-        fn wake_by_ref(self: &Arc<Self>) {
-            let clone = Arc::clone(&self);
-            self.ready_queue
-                .send(clone)
-                .expect("Failed to send task to `ready_queue`");
+            while let Ok(token) = self.receiver.recv() {
+                let mut finished = false;
+                {
+                    // println!("Executor::run --> received {}", token);
+                    let task = self.task_map.get(&token).unwrap_or_else(|| panic!("Invalid task token {}", token));
+                    let future = &mut *task.future.lock().unwrap();
+
+                    let waker = Waker::from(Arc::clone(&task));
+                    let cx = &mut Context::from_waker(&waker);
+
+                    if future.as_mut().poll(cx).is_ready() {
+                        finished = true;
+                    }
+                }
+                // Used to circumvent the borrow-checker. Otherwise, `future` could
+                // be pointing to garbage upon calling remove.
+                if finished {
+                    self.task_map.remove(&token).unwrap();
+                    
+                    // Done processing all suspended events.
+                    if self.task_map.is_empty() {
+                        break;
+                    }
+                }
+            }
+            // println!("Executor::run --> Finished running");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use futures::io::{AsyncReadExt, AsyncWriteExt};
-    use std::sync::mpsc;
-
-    #[test]
-    fn it_works() {
-        const MAX_CHANNELS: usize = 1000;
-
-        let (sender, receiver) = mpsc::sync_channel(MAX_CHANNELS);
-
-        let blocker = blockers::IoBlocker::new().unwrap();
-        let registrator = blocker.registrator();
-        let reactor = runtime::Reactor::new(sender, blocker);
-        let executor = runtime::Executor::new(receiver);
-
-        // This site simulates slow server responses.
-        let addr = "flash.siwalik.in:80";
-        // let addr = "127.0.0.1:3000";
-
-        for i in 4..10 {
-            let reactor = &reactor;
-            let mut stream = services::TcpStream::connect(addr, registrator, i).unwrap();
-
-            let future = async move {
-                let delay = i * 1000;
-                // The desired delay is passed in the GET request in miliseconds.
-                let request = format!(
-                    "GET /delay/{}/url/http://www.google.com HTTP/1.1\r\n\
-                    Host: flash.siwalik.in\r\n\
-                    Connection: close\r\n\
-                    \r\n",
-                    delay
-                );
-                stream.write_all(request.as_bytes()).await.unwrap();
-
-                let mut buf = String::new();
-                stream.read_to_string(&mut buf).await.unwrap();
-                println!("contents: {}", buf);
-            };
-            reactor.subscribe(future, i);
+        pub fn suspend(&mut self, task: Arc<Task>) {
+            self.task_map.insert(task.token, task);
         }
-        executor.run();
     }
 }
