@@ -2,13 +2,6 @@
 mod epoll {
     use std::io;
 
-    pub const EPOLL_CTL_ADD: i32 = 1;
-    pub const EPOLL_CTL_DEL: i32 = 2;
-    pub const EPOLL_CTL_MOD: i32 = 3;
-    pub const EPOLLIN: i32 = 0x1;
-    pub const EPOLLONESHOT: i32 = 1 << 30;
-    pub const EPOLLET: i32 = 1 << 31;
-
     // Module providing unsafe ffi for Linux's epoll and epoll-adjacent syscalls.
     mod ffi {
         #[link(name = "c")]
@@ -96,7 +89,9 @@ pub mod blockers {
         fd: RawFd,
     }
 
+    // Abstraction around `epoll`. Allows for blocking until an I/O event is ready.
     impl IoBlocker {
+        // Initialize an `epoll` instance.
         pub fn new() -> io::Result<Self> {
             match epoll::create() {
                 Ok(fd) => Ok(IoBlocker { fd }),
@@ -104,6 +99,7 @@ pub mod blockers {
             }
         }
 
+        // Generate a registrator that can register events to this IoBlocker's epoll.
         pub fn registrator(&self) -> Registrator {
             Registrator { fd: self.fd }
         }
@@ -113,7 +109,6 @@ pub mod blockers {
             const TIMEOUT: i32 = -1; // Wait forever.
             const MAX_EVENTS: i32 = 1024;
             events.clear();
-            // std::thread::sleep(core::time::Duration::from_secs(1));
 
             // println!("IoBlocker::block --> begin blocking");
             let n_events = epoll::wait(self.fd, events, MAX_EVENTS, TIMEOUT)?;
@@ -127,7 +122,7 @@ pub mod blockers {
         }
     }
 
-    // Ensure that we close held file descriptor.
+    // Ensure that we close held `epoll` file descriptor.
     impl Drop for IoBlocker {
         fn drop(&mut self) {
             // println!("IoBlocker::drop --> dropping");
@@ -135,7 +130,11 @@ pub mod blockers {
         }
     }
 
-    // Struct to get around Rust ownership issues
+    // There should only be a single IoBlocker for a given `epoll` instance,
+    // since IoBlocker is responsible for creating and destroying its file descriptor.
+    // However, we need some way for multiple different I/O events to register
+    // themselves to an `epoll`. For this reason, we need a class that can be
+    // duplicated such that each task can own its own copy. This is the Registrator.
     #[derive(Debug, Clone, Copy)] // Helpful default traits.
     pub struct Registrator {
         fd: RawFd,
@@ -147,21 +146,21 @@ pub mod blockers {
             let fd = interest.as_raw_fd();
 
             // Listen for file to become readable.
-            let mut event = epoll::Event::new(epoll::EPOLLIN | epoll::EPOLLONESHOT, token);
-            match epoll::ctl(self.fd, epoll::EPOLL_CTL_ADD, fd, &mut event) {
+            let mut event = epoll::Event::new(libc::EPOLLIN | libc::EPOLLONESHOT, token);
+            match epoll::ctl(self.fd, libc::EPOLL_CTL_ADD, fd, &mut event) {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     // one-shot epoll consumed, so needs to be re-armed.
-                    epoll::ctl(self.fd, epoll::EPOLL_CTL_MOD, fd, &mut event)
-                },
+                    epoll::ctl(self.fd, libc::EPOLL_CTL_MOD, fd, &mut event)
+                }
                 Err(e) => Err(e),
             }
         }
 
         pub fn unregister(&self, interest: &impl AsRawFd, token: usize) -> io::Result<()> {
             let fd = interest.as_raw_fd();
-            let mut event = epoll::Event::new(epoll::EPOLLIN | epoll::EPOLLET, token);
-            match epoll::ctl(self.fd, epoll::EPOLL_CTL_DEL, fd, &mut event) {
+            let mut event = epoll::Event::new(libc::EPOLLIN | libc::EPOLLET, token);
+            match epoll::ctl(self.fd, libc::EPOLL_CTL_DEL, fd, &mut event) {
                 Ok(_) => Ok(()),
                 Err(e) => Err(e),
             }
@@ -172,12 +171,14 @@ pub mod blockers {
 // Provides future API for awaitable services. For use by external crates.
 // In this case, the only provided service is a TcpStream.
 pub mod services {
-    use crate::blockers;
+    use crate::blockers::{self, Registrator};
     use futures::io::{AsyncRead, AsyncWrite};
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     use std::io::{self, Error, Read, Write};
     use std::net::Shutdown;
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::{
+        future::Future,
         net,
         pin::Pin,
         task::{Context, Poll},
@@ -190,14 +191,61 @@ pub mod services {
         token: usize,
     }
 
+    pub struct ConnectStreamFuture<'a> {
+        socket: &'a Socket,
+        addr: SockAddr,
+        registrator: Registrator,
+        token: usize,
+    }
+
+    impl Future for ConnectStreamFuture<'_> {
+        type Output = Result<(), io::Error>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match self.socket.connect(&self.addr) {
+                // Finished connecting, done polling.
+                Ok(_) => Poll::Ready(Ok(())),
+                // Since we set this TcpStream to non-blocking, check if
+                // return value still not ready.
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EINPROGRESS)
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    self.registrator.register(self.socket, self.token).unwrap();
+                    Poll::Pending
+                }
+                // Error occurred, done polling.
+                Err(e) => Poll::Ready(Err(e)),
+            }
+        }
+    }
+
     impl TcpStream {
-        pub fn connect(
-            addr: impl net::ToSocketAddrs,
+        // Asynchronously connect this stream to a socket address.
+        // Reference: https://docs.rs/async-io/latest/src/async_io/lib.rs.html#1867
+        pub async fn connect(
+            addr_generator: impl net::ToSocketAddrs,
             registrator: blockers::Registrator,
             token: usize,
         ) -> io::Result<Self> {
-            let stream = net::TcpStream::connect(addr)?;
-            stream.set_nonblocking(true)?;
+            let sock_type = Type::STREAM.nonblocking();
+            let protocol = Protocol::TCP;
+            let socket_addr = addr_generator.to_socket_addrs().unwrap().next().unwrap();
+            let domain = Domain::for_address(socket_addr);
+
+            let socket = Socket::new(domain, sock_type, Some(protocol))
+                .unwrap_or_else(|_| panic!("Failed to create socket at address {}", socket_addr));
+
+            // wait for the socket to become writeable.
+            TcpStream::sock_connect(
+                &socket,
+                SockAddr::from(socket_addr),
+                registrator.clone(),
+                token,
+            )
+            .await?;
+
+            let stream = net::TcpStream::from(socket);
 
             Ok(TcpStream {
                 inner: stream,
@@ -205,8 +253,23 @@ pub mod services {
                 token,
             })
         }
+
+        fn sock_connect(
+            socket: &Socket,
+            addr: SockAddr,
+            registrator: Registrator,
+            token: usize,
+        ) -> ConnectStreamFuture {
+            return ConnectStreamFuture {
+                socket,
+                addr,
+                registrator,
+                token,
+            };
+        }
     }
 
+    // Allow calling async read operations on socket.
     impl AsyncRead for TcpStream {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -230,6 +293,7 @@ pub mod services {
         }
     }
 
+    // Allow calling async write operations on socket.
     impl AsyncWrite for TcpStream {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -308,6 +372,7 @@ pub mod runtime {
         // We use a `SyncSender` as opposed to a regular `Sender` to allow for sharing
         // the sender between threads.
         ready_queue: mpsc::SyncSender<usize>,
+        // Unique identifier for this task.
         token: usize,
     }
 
@@ -348,7 +413,6 @@ pub mod runtime {
         }
     }
 
-    
     impl Reactor {
         // Create a new Reactor instance.
         pub fn new(sender: mpsc::SyncSender<usize>) -> Reactor {
@@ -400,7 +464,10 @@ pub mod runtime {
                 let mut finished = false;
                 {
                     // println!("Executor::run --> received {}", token);
-                    let task = self.task_map.get(&token).unwrap_or_else(|| panic!("Invalid task token {}", token));
+                    let task = self
+                        .task_map
+                        .get(&token)
+                        .unwrap_or_else(|| panic!("Invalid task token {}", token));
                     let future = &mut *task.future.lock().unwrap();
 
                     let waker = Waker::from(Arc::clone(&task));
@@ -414,7 +481,7 @@ pub mod runtime {
                 // be pointing to garbage upon calling remove.
                 if finished {
                     self.task_map.remove(&token).unwrap();
-                    
+
                     // Done processing all suspended events.
                     if self.task_map.is_empty() {
                         break;
