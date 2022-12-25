@@ -1,0 +1,40 @@
+hello from client 7
+hello from client 5
+hello from client 6
+hello from client 8
+hello from client 9
+hello from client 4
+hello from client 3
+hello from client 2
+hello from client 0
+hello from client 1
+0: connected at 473µs, sent at 500.1µs, received at 3.9435201s
+0: hello from server
+
+1: connected at 418.5µs, sent at 445.6µs, received at 3.9435438s
+1: hello from server
+
+2: connected at 386.7µs, sent at 414.1µs, received at 3.9436685s
+2: hello from server
+
+3: connected at 444µs, sent at 471.3µs, received at 3.9437922s
+3: hello from server
+
+4: connected at 454.7µs, sent at 482µs, received at 3.9438652s
+4: hello from server
+
+5: connected at 490.2µs, sent at 518.1µs, received at 3.9440915s
+5: hello from server
+
+6: connected at 478.9µs, sent at 515µs, received at 3.9440618s
+6: hello from server
+
+7: connected at 534.2µs, sent at 564.2µs, received at 3.9442254s
+7: hello from server
+
+9: connected at 463.4µs, sent at 490.9µs, received at 3.9440001s
+9: hello from server
+
+8: connected at 477.9µs, sent at 506µs, received at 3.9440753s
+8: hello from server
+
